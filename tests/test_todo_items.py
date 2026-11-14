@@ -34,8 +34,8 @@ class PayloadTest(unittest.TestCase):
     self.assertEqual(payload["i"], [
       {"u": "a1", "t": "Buy milk"},
       {"u": "c3", "t": "Call the plumber", "d": "2026-11-20"},
-      # 23:30 UTC is the next day in local time.
-      {"u": "d4", "t": "Late call", "d": "2026-11-21"},
+      # 23:30 UTC is 00:30 the next day in local time.
+      {"u": "d4", "t": "Late call", "d": "2026-11-21T00:30"},
     ])
 
   def test_a_long_uid_is_left_out_so_the_item_cannot_be_ticked(self):

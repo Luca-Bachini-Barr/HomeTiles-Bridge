@@ -11,7 +11,8 @@ open items of one Home Assistant to-do list and may tick one off:
 Assistant reported (it can exceed the items sent), "i" the open items in Home
 Assistant's order: "u" the item's uid (left out when it is too long to send,
 so the panel cannot tick that item off), "t" the summary and "d" the due day
-(local, "YYYY-MM-DD") when there is one. The payload is bounded (items, text
+(local, "YYYY-MM-DD", or "YYYY-MM-DDTHH:MM" when Home Assistant has a due
+time) when there is one. The payload is bounded (items, text
 bytes, total bytes); when it must drop items it drops the last ones.
 
 Commands: ``{base}/cmnd/todo`` with ``{"entity_id": ..., "action":
@@ -58,7 +59,8 @@ def _clip_utf8(text: Any, limit: int) -> str:
 
 
 def _due_day(value: Any, zone: Optional[tzinfo]) -> Optional[str]:
-  """The local due day of an item ("YYYY-MM-DD"), None without a readable one."""
+  """The local due of an item: "YYYY-MM-DD", or "YYYY-MM-DDTHH:MM" when it has
+  a time; None without a readable one."""
   if isinstance(value, datetime):
     moment = value
   elif isinstance(value, date):
@@ -78,7 +80,7 @@ def _due_day(value: Any, zone: Optional[tzinfo]) -> Optional[str]:
     return None
   if moment.tzinfo is not None and zone is not None:
     moment = moment.astimezone(zone)
-  return moment.date().isoformat()
+  return f"{moment.date().isoformat()}T{moment.hour:02d}:{moment.minute:02d}"
 
 
 def features_of(attributes: Mapping[str, Any]) -> int:
