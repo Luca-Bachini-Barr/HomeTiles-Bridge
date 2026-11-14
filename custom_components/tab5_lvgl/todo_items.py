@@ -12,7 +12,7 @@ Assistant reported (it can exceed the items sent), "i" the open items in Home
 Assistant's order: "u" the item's uid (left out when it is too long to send,
 so the panel cannot tick that item off), "t" the summary and "d" the due day
 (local, "YYYY-MM-DD", or "YYYY-MM-DDTHH:MM" when Home Assistant has a due
-time) when there is one. The payload is bounded (items, text
+time) when there is one, and "x" the description when it has one. The payload is bounded (items, text
 bytes, total bytes); when it must drop items it drops the last ones.
 
 Commands: ``{base}/cmnd/todo`` with ``{"entity_id": ..., "action":
@@ -43,14 +43,20 @@ FETCH_TIMEOUT_S = 20.0
 MAX_ITEMS = 32
 MAX_TITLE_BYTES = 63
 MAX_UID_BYTES = 160
-MAX_PAYLOAD_BYTES = 8192
+MAX_DESCRIPTION_BYTES = 200
+MAX_PAYLOAD_BYTES = 16384
 MAX_COMMAND_BYTES = 512
 # The panel alerts an item once within this long after its due time.
 ANNOUNCE_WINDOW_S = 15 * 60
-# Home Assistant's own announce chime (assist_satellite static files).
-ANNOUNCE_CHIME_URL = "/api/assist_satellite/static/preannounce.mp3"
-# The chime is about a second long; the reminder follows it.
-ANNOUNCE_CHIME_S = 1.5
+# The alarm between the spoken title and description: a loud three-beep
+# burst shipped with the Bridge (sounds/todo_alarm.wav, served at this path).
+# Home Assistant's announce chime is recorded far quieter than speech.
+ALARM_FILE = "sounds/todo_alarm.wav"
+ALARM_URL = "/tab5_lvgl/sounds/todo_alarm.wav"
+# How long the Bridge waits for one part of the reminder to start playing,
+# and at most for it to finish, before the next part follows.
+PART_START_TIMEOUT_S = 4.0
+PART_MAX_S = 60.0
 # The spoken reminder, by the Assist pipeline's language (base code).
 _REMINDER = {
   "en": "Reminder: {title}", "de": "Erinnerung: {title}", "fr": "Rappel : {title}",
@@ -131,6 +137,9 @@ def normalise_items(items: Iterable[Any], zone: Optional[tzinfo]) -> List[Dict[s
     due = _due_day(item.get("due"), zone)
     if due:
       entry["d"] = due
+    description = _clip_utf8(item.get("description"), MAX_DESCRIPTION_BYTES)
+    if description:
+      entry["x"] = description
     out.append(entry)
   return out
 
@@ -229,8 +238,9 @@ def reminder_message(title: str, language: Optional[str]) -> str:
   return _REMINDER.get(base, _REMINDER["en"]).format(title=title)
 
 
-def announce_title(command: Mapping[str, Any], payload: str, now: datetime) -> Optional[str]:
-  """The title to announce for an "announce" command, None when not allowed.
+def announce_item(command: Mapping[str, Any], payload: str, now: datetime) -> Optional[Dict[str, str]]:
+  """{"title", "description"} to announce for an "announce" command, None
+  when not allowed.
 
   `payload` is the list's last published payload and `now` local time
   without an offset. Only an item of that payload with a due time that
@@ -258,7 +268,13 @@ def announce_title(command: Mapping[str, Any], payload: str, now: datetime) -> O
     since = (now.replace(tzinfo=None) - moment).total_seconds()
     title = item.get("t")
     if 0 <= since < ANNOUNCE_WINDOW_S and isinstance(title, str) and title:
-      return title
+      description = item.get("x")
+      return {"title": title, "description": description if isinstance(description, str) else ""}
     return None
   return None
 
+
+def announce_title(command: Mapping[str, Any], payload: str, now: datetime) -> Optional[str]:
+  """The title of announce_item, None when not allowed."""
+  item = announce_item(command, payload, now)
+  return item["title"] if item else None

@@ -10,6 +10,7 @@ from ipaddress import ip_address
 import json
 import logging
 import secrets
+import os
 from time import monotonic
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
@@ -788,6 +789,18 @@ async def async_setup(hass: HomeAssistant, config: Dict[str, Any]) -> bool:
   domain_data.setdefault(DATA_MQTT_ENTRIES, set())
 
   await async_ensure_link_runtime(hass)
+
+  if not domain_data.get("todo_sounds"):
+    # The To-do reminder's alarm (todo_items.ALARM_URL), public like
+    # Home Assistant's own announce chime.
+    try:
+      from homeassistant.components.http import StaticPathConfig
+      await hass.http.async_register_static_paths([
+        StaticPathConfig(todo_items.ALARM_URL, os.path.join(os.path.dirname(__file__), todo_items.ALARM_FILE), True),
+      ])
+      domain_data["todo_sounds"] = True
+    except Exception as err:
+      _LOGGER.warning("HomeTiles to-do alarm sound could not be served: %s", err)
 
   if "camera_stream_manager" not in domain_data:
     camera_stream_manager = CameraStreamManager(hass)
@@ -2713,13 +2726,33 @@ class Tab5Bridge:
       self.hass, self._ha_topic_for_entity(entity_id, "items"), payload, qos=0, retain=True,
     )
 
+  async def _async_wait_player_done(self, player: str) -> None:
+    """Waits until the panel's speaker started the last request and finished it."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + todo_items.PART_START_TIMEOUT_S
+    while loop.time() < deadline:
+      state = self.hass.states.get(player)
+      if state is not None and state.state == "playing":
+        break
+      await asyncio.sleep(0.2)
+    else:
+      return
+    deadline = loop.time() + todo_items.PART_MAX_S
+    while loop.time() < deadline:
+      state = self.hass.states.get(player)
+      if state is None or state.state != "playing":
+        return
+      await asyncio.sleep(0.2)
+
   async def _async_announce_todo(self, entity_id: str, command: Dict[str, Any]) -> None:
-    """The panel's due alert: Home Assistant's announce chime, then a spoken
-    reminder in the preferred Assist pipeline's voice, on this panel's speaker."""
-    title = todo_items.announce_title(
+    """The panel's due alert on its speaker: the task's title spoken, one
+    alarm (todo_items.ALARM_URL), then its description spoken when it has
+    one, each part after the previous one finished. Speech uses the preferred
+    Assist pipeline's TTS; without one only the alarm plays."""
+    item = todo_items.announce_item(
       command, self._todo_last_payload.get(entity_id, ""), dt_util.now().replace(tzinfo=None),
     )
-    if title is None:
+    if item is None:
       _LOGGER.debug("Ignoring HomeTiles to-do announce for %s (not a just-due item)", entity_id)
       return
     key = f"{entity_id}|{command.get('uid')}"
@@ -2734,33 +2767,37 @@ class Tab5Bridge:
     if not player:
       _LOGGER.debug("HomeTiles to-do announce for %s: this panel has no speaker", entity_id)
       return
+    engine, language, voice = None, None, None
     try:
-      await self.hass.services.async_call(
-        "media_player", "play_media",
-        {"entity_id": player, "media_content_id": todo_items.ANNOUNCE_CHIME_URL,
-         "media_content_type": "music", "announce": True},
-        blocking=True,
-      )
-      await asyncio.sleep(todo_items.ANNOUNCE_CHIME_S)
-      engine, language, voice = None, None, None
-      try:
-        from homeassistant.components import assist_pipeline
-        pipeline = assist_pipeline.async_get_pipeline(self.hass)
-        engine, language, voice = pipeline.tts_engine, pipeline.tts_language, pipeline.tts_voice
-      except Exception as err:
-        _LOGGER.debug("HomeTiles to-do announce: no Assist pipeline (%r)", err)
-      if not engine or not str(engine).startswith("tts."):
-        _LOGGER.debug("HomeTiles to-do announce for %s: chime only (TTS engine %s)", entity_id, engine)
-        return
-      data: Dict[str, Any] = {
-        "entity_id": engine, "media_player_entity_id": player,
-        "message": todo_items.reminder_message(title, language or self.hass.config.language),
-      }
+      from homeassistant.components import assist_pipeline
+      pipeline = assist_pipeline.async_get_pipeline(self.hass)
+      engine, language, voice = pipeline.tts_engine, pipeline.tts_language, pipeline.tts_voice
+    except Exception as err:
+      _LOGGER.debug("HomeTiles to-do announce: no Assist pipeline (%r)", err)
+    if engine and not str(engine).startswith("tts."):
+      engine = None
+
+    async def speak(message: str) -> None:
+      data: Dict[str, Any] = {"entity_id": engine, "media_player_entity_id": player, "message": message}
       if language:
         data["language"] = language
       if voice:
         data["options"] = {"voice": voice}
       await self.hass.services.async_call("tts", "speak", data, blocking=True)
+      await self._async_wait_player_done(player)
+
+    try:
+      if engine:
+        await speak(item["title"])
+      await self.hass.services.async_call(
+        "media_player", "play_media",
+        {"entity_id": player, "media_content_id": todo_items.ALARM_URL,
+         "media_content_type": "music", "announce": True},
+        blocking=True,
+      )
+      await self._async_wait_player_done(player)
+      if engine and item["description"]:
+        await speak(item["description"])
       _LOGGER.debug("HomeTiles to-do reminder announced for %s on %s", entity_id, player)
     except Exception:
       _LOGGER.warning("HomeTiles to-do reminder for %s could not play", entity_id, exc_info=True)

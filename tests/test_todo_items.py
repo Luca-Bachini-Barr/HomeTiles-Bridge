@@ -38,6 +38,15 @@ class PayloadTest(unittest.TestCase):
       {"u": "d4", "t": "Late call", "d": "2026-11-21T00:30"},
     ])
 
+  def test_descriptions_travel_clipped_and_empty_ones_are_left_out(self):
+    items = [{"uid": "a", "summary": "With", "description": "  Two   scoops\n of food "},
+             {"uid": "b", "summary": "Without", "description": "   "},
+             {"uid": "c", "summary": "Long", "description": "ü" * 150}]
+    payload = json.loads(TODO.build_payload(items, "3", 4, None))
+    self.assertEqual(payload["i"][0]["x"], "Two scoops of food")
+    self.assertNotIn("x", payload["i"][1])
+    self.assertLessEqual(len(payload["i"][2]["x"].encode("utf-8")), TODO.MAX_DESCRIPTION_BYTES)
+
   def test_a_long_uid_is_left_out_so_the_item_cannot_be_ticked(self):
     payload = json.loads(TODO.build_payload(
       [{"uid": "x" * (TODO.MAX_UID_BYTES + 1), "summary": "Shown", "status": "needs_action"}], "1", 4, None))
@@ -126,9 +135,26 @@ class AnnounceTest(unittest.TestCase):
   def test_handler_plays_chime_then_reminder_once(self):
     source = (ROOT / "__init__.py").read_text(encoding="utf-8")
     self.assertIn('if command.get("action") == "announce":', source)
-    self.assertIn('"media_content_id": todo_items.ANNOUNCE_CHIME_URL', source)
+    self.assertIn('"media_content_id": todo_items.ALARM_URL', source)
     self.assertIn('await self.hass.services.async_call("tts", "speak", data, blocking=True)', source)
+    # Title, then the alarm, then the description, each after the last finished.
+    body = source[source.index("  async def _async_announce_todo("):source.index("  def _stop_todo_updates(")]
+    title = body.index('await speak(item["title"])')
+    alarm = body.index('"media_content_id": todo_items.ALARM_URL')
+    description = body.index('await speak(item["description"])')
+    self.assertLess(title, alarm)
+    self.assertLess(alarm, description)
+    self.assertIn("StaticPathConfig(todo_items.ALARM_URL", source)
+    self.assertTrue((ROOT / TODO.ALARM_FILE).is_file(), "the alarm sound ships with the Bridge")
     self.assertIn("if key in self._todo_announced:", source)
+
+  def test_announce_item_carries_the_description(self):
+    payload = json.dumps({"v": 1, "state": "1", "f": 15, "n": 1, "i": [
+      {"u": "a1", "t": "Feed the cat", "d": "2026-11-14T22:30", "x": "Two scoops"}]})
+    self.assertEqual(TODO.announce_item({"action": "announce", "uid": "a1"}, payload, datetime(2026, 11, 14, 22, 31)),
+                     {"title": "Feed the cat", "description": "Two scoops"})
+    self.assertEqual(TODO.announce_item({"action": "announce", "uid": "a1"}, self.PAYLOAD.replace("Feed", "Feed"),
+                                        datetime(2026, 11, 14, 22, 31))["description"], "")
 
 
 class ListWiringTest(unittest.TestCase):
