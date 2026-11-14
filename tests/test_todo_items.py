@@ -250,12 +250,22 @@ class PublisherWiringTest(unittest.IsolatedAsyncioTestCase):
       self.bridge._schedule_todo_refresh(["todo.stuck"])
       await self.run_due()
       await asyncio.sleep(0.1)
-      self.assertIsNone(self.bridge._todo_task, "the stuck fetch gave up")
+      self.assertTrue(self.bridge._todo_task.done(), "the stuck fetch gave up")
       self.bridge._schedule_todo_refresh(["todo.home"])
       await self.run_due()
       self.assertEqual([topic for topic, _, _ in self.publishes], ["ha/todo/home/items"])
     finally:
       TODO.FETCH_TIMEOUT_S = 20.0
+
+  async def test_a_finished_task_does_not_block_later_refreshes(self):
+    # Home Assistant may finish a task before async_create_task returns it
+    # (eager start); the stored task is then done, never None.
+    finished = asyncio.get_running_loop().create_future()
+    finished.set_result(None)
+    self.bridge._todo_task = finished
+    self.bridge._schedule_todo_refresh(["todo.home"])
+    await self.run_due()
+    self.assertEqual([topic for topic, _, _ in self.publishes], ["ha/todo/home/items"])
 
   async def test_another_entry_owning_the_list_and_unload(self):
     self.bridge.hass.data["tab5_lvgl"]["state_owners"] = {("ha", "todo.home"): "entry2"}

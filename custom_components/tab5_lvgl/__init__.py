@@ -2648,7 +2648,10 @@ class Tab5Bridge:
     @callback
     def _due(_now) -> None:
       self._todo_refresh_handle = None
-      if self._todo_task is None:
+      # Home Assistant may run the task to its end before returning it (eager
+      # start), so a finished task, not None, also means "not running".
+      task = self._todo_task
+      if task is None or task.done():
         self._todo_task = self.hass.async_create_task(self._async_process_todo_updates())
 
     self._todo_refresh_handle = async_call_later(self.hass, todo_items.DEBOUNCE_S, _due)
@@ -2658,15 +2661,12 @@ class Tab5Bridge:
     self._schedule_todo_refresh(self.todos)
 
   async def _async_process_todo_updates(self) -> None:
-    try:
-      while self._runtime_setup_complete and self._todo_pending:
-        entity_id = self._todo_pending.pop()
-        try:
-          await self._async_publish_todo_items(entity_id)
-        except Exception:
-          _LOGGER.debug("Tab5 to-do update failed for %s", entity_id, exc_info=True)
-    finally:
-      self._todo_task = None
+    while self._runtime_setup_complete and self._todo_pending:
+      entity_id = self._todo_pending.pop()
+      try:
+        await self._async_publish_todo_items(entity_id)
+      except Exception:
+        _LOGGER.debug("Tab5 to-do update failed for %s", entity_id, exc_info=True)
 
   async def _async_publish_todo_items(self, entity_id: str) -> None:
     """The To-do tile's open items of one list on its retained `items` topic."""
@@ -2693,7 +2693,7 @@ class Tab5Bridge:
         )
       except Exception as err:
         # Keep the last retained items rather than publishing an empty list.
-        _LOGGER.debug("Tab5 todo.get_items failed for %s (%s)", entity_id, err)
+        _LOGGER.debug("Tab5 todo.get_items failed for %s (%r)", entity_id, err)
         return
       items = todo_items.items_of_response(response, entity_id)
       if items is None:
