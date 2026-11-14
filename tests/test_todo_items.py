@@ -127,6 +127,7 @@ METHODS = {
 class PublisherWiringTest(unittest.IsolatedAsyncioTestCase):
   async def asyncSetUp(self) -> None:
     self.publishes: list[tuple[str, dict, bool]] = []
+    self.hanging: set = set()
     self.calls: list[tuple] = []
     self.timers: list = []
     self.intervals: list = []
@@ -140,6 +141,8 @@ class PublisherWiringTest(unittest.IsolatedAsyncioTestCase):
 
     async def call(domain, service, data, blocking=False, return_response=False):
       self.calls.append((domain, service, dict(data), blocking, return_response))
+      if data.get("entity_id") in self.hanging:
+        await asyncio.Event().wait()
       if isinstance(self.response, Exception) and service == "get_items":
         raise self.response
       return self.response if return_response else None
@@ -158,6 +161,7 @@ class PublisherWiringTest(unittest.IsolatedAsyncioTestCase):
       "callback": lambda function: function, "entity_domain": CONTROL.entity_domain,
       "mqtt": types.SimpleNamespace(async_publish=publish), "async_call_later": call_later,
       "async_track_time_interval": interval, "DOMAIN": "tab5_lvgl", "timedelta": timedelta,
+      "asyncio": asyncio,
       "dt_util": types.SimpleNamespace(now=lambda: datetime(2026, 11, 14, 9, 0, tzinfo=LONDON_SUMMER),
                                        get_default_time_zone=lambda: LONDON_SUMMER),
       "_LOGGER": logging.getLogger("test_todo_items"),
@@ -236,6 +240,22 @@ class PublisherWiringTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(self.calls[0][:3], ("todo", "update_item",
                                          {"entity_id": "todo.home", "item": "a1", "status": "completed"}))
     self.assertEqual(len(self.timers), 1, "the shorter list is published right after")
+
+  async def test_a_list_that_never_answers_does_not_block_the_others(self):
+    TODO.FETCH_TIMEOUT_S = 0.05
+    try:
+      self.bridge.todos = ["todo.home", "todo.stuck"]
+      self.states["todo.stuck"] = types.SimpleNamespace(state="1", attributes={"supported_features": ALL_FEATURES})
+      self.hanging.add("todo.stuck")
+      self.bridge._schedule_todo_refresh(["todo.stuck"])
+      await self.run_due()
+      await asyncio.sleep(0.1)
+      self.assertIsNone(self.bridge._todo_task, "the stuck fetch gave up")
+      self.bridge._schedule_todo_refresh(["todo.home"])
+      await self.run_due()
+      self.assertEqual([topic for topic, _, _ in self.publishes], ["ha/todo/home/items"])
+    finally:
+      TODO.FETCH_TIMEOUT_S = 20.0
 
   async def test_another_entry_owning_the_list_and_unload(self):
     self.bridge.hass.data["tab5_lvgl"]["state_owners"] = {("ha", "todo.home"): "entry2"}

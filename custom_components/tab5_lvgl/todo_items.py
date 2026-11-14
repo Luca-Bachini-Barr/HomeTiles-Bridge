@@ -33,6 +33,9 @@ PAYLOAD_VERSION = 1
 REFRESH_S = 5 * 60
 # Coalesces state changes and snapshots of the same moment.
 DEBOUNCE_S = 2.0
+# How long one list's todo.get_items may take before the Bridge gives up
+# and keeps its retained items.
+FETCH_TIMEOUT_S = 20.0
 MAX_ITEMS = 32
 MAX_TITLE_BYTES = 63
 MAX_UID_BYTES = 160

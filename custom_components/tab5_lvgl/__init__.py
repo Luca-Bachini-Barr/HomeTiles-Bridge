@@ -2633,8 +2633,10 @@ class Tab5Bridge:
   def _schedule_todo_refresh(self, entity_ids: Iterable[str]) -> None:
     """Fetch and publish the open items of `entity_ids` shortly (coalesced)."""
     if not self._runtime_setup_complete:
+      _LOGGER.debug("Tab5 to-do refresh skipped before setup: %s", list(entity_ids))
       return
     self._todo_pending.update(e for e in entity_ids if e in self.todos)
+    _LOGGER.debug("Tab5 to-do refresh scheduled: %s", sorted(self._todo_pending))
     if self._todo_pending and self._unsub_todo_interval is None:
       # Started with the first list: renamed items do not change the state.
       self._unsub_todo_interval = async_track_time_interval(
@@ -2669,18 +2671,25 @@ class Tab5Bridge:
   async def _async_publish_todo_items(self, entity_id: str) -> None:
     """The To-do tile's open items of one list on its retained `items` topic."""
     if entity_id not in self.todos or entity_domain(entity_id) != TODO_DOMAIN:
+      _LOGGER.debug("Tab5 to-do %s is not an offered list", entity_id)
       return
     if not self._owns_state_publish(entity_id):
+      _LOGGER.debug("Tab5 to-do %s is published by another entry", entity_id)
       return
     state = self.hass.states.get(entity_id)
     if state is None or state.state == "unavailable":
       payload = todo_items.unavailable_payload()
     else:
       try:
-        response = await self.hass.services.async_call(
-          TODO_DOMAIN, "get_items",
-          {"entity_id": entity_id, "status": [todo_items.STATUS_OPEN]},
-          blocking=True, return_response=True,
+        # A list whose integration never answers (seen with MS365 To Do)
+        # must not hold up the other lists' refreshes.
+        response = await asyncio.wait_for(
+          self.hass.services.async_call(
+            TODO_DOMAIN, "get_items",
+            {"entity_id": entity_id, "status": [todo_items.STATUS_OPEN]},
+            blocking=True, return_response=True,
+          ),
+          todo_items.FETCH_TIMEOUT_S,
         )
       except Exception as err:
         # Keep the last retained items rather than publishing an empty list.
@@ -2694,8 +2703,10 @@ class Tab5Bridge:
         items, state.state, todo_items.features_of(state.attributes), zone,
       )
     if self._todo_last_payload.get(entity_id) == payload:
+      _LOGGER.debug("Tab5 to-do items of %s unchanged", entity_id)
       return
     self._todo_last_payload[entity_id] = payload
+    _LOGGER.debug("Tab5 to-do items of %s published (%d bytes)", entity_id, len(payload))
     await mqtt.async_publish(
       self.hass, self._ha_topic_for_entity(entity_id, "items"), payload, qos=0, retain=True,
     )
