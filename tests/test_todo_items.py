@@ -137,13 +137,16 @@ class AnnounceTest(unittest.TestCase):
     self.assertIn('if command.get("action") == "announce":', source)
     self.assertIn('"media_content_id": todo_items.ALARM_URL', source)
     self.assertIn('await self.hass.services.async_call("tts", "speak", data, blocking=True)', source)
-    # Title, then the alarm, then the description, each after the last finished.
+    # Alarm, title, alarm, then the description, each after the last finished.
     body = source[source.index("  async def _async_announce_todo("):source.index("  def _stop_todo_updates(")]
-    title = body.index('await speak(item["title"])')
-    alarm = body.index('"media_content_id": todo_items.ALARM_URL')
-    description = body.index('await speak(item["description"])')
-    self.assertLess(title, alarm)
-    self.assertLess(alarm, description)
+    sequence = body[body.index("    try:\n      await alarm()"):]
+    first_alarm = sequence.index("await alarm()")
+    title = sequence.index('await speak(item["title"])')
+    second_alarm = sequence.index("await alarm()", title)
+    description = sequence.index('await speak(item["description"])')
+    self.assertLess(first_alarm, title)
+    self.assertLess(title, second_alarm)
+    self.assertLess(second_alarm, description)
     self.assertIn("StaticPathConfig(todo_items.ALARM_URL", source)
     self.assertTrue((ROOT / TODO.ALARM_FILE).is_file(), "the alarm sound ships with the Bridge")
     self.assertIn("if key in self._todo_announced:", source)

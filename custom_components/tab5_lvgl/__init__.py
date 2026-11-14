@@ -2745,9 +2745,9 @@ class Tab5Bridge:
       await asyncio.sleep(0.2)
 
   async def _async_announce_todo(self, entity_id: str, command: Dict[str, Any]) -> None:
-    """The panel's due alert on its speaker: the task's title spoken, one
-    alarm (todo_items.ALARM_URL), then its description spoken when it has
-    one, each part after the previous one finished. Speech uses the preferred
+    """The panel's due alert on its speaker: an alarm (todo_items.ALARM_URL),
+    the task's title spoken, the alarm again, then its description spoken
+    when it has one, each part after the previous one finished. Speech uses the preferred
     Assist pipeline's TTS; without one only the alarm plays."""
     item = todo_items.announce_item(
       command, self._todo_last_payload.get(entity_id, ""), dt_util.now().replace(tzinfo=None),
@@ -2786,9 +2786,7 @@ class Tab5Bridge:
       await self.hass.services.async_call("tts", "speak", data, blocking=True)
       await self._async_wait_player_done(player)
 
-    try:
-      if engine:
-        await speak(item["title"])
+    async def alarm() -> None:
       await self.hass.services.async_call(
         "media_player", "play_media",
         {"entity_id": player, "media_content_id": todo_items.ALARM_URL,
@@ -2796,6 +2794,12 @@ class Tab5Bridge:
         blocking=True,
       )
       await self._async_wait_player_done(player)
+
+    try:
+      await alarm()
+      if engine:
+        await speak(item["title"])
+        await alarm()
       if engine and item["description"]:
         await speak(item["description"])
       _LOGGER.debug("HomeTiles to-do reminder announced for %s on %s", entity_id, player)
