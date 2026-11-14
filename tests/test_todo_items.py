@@ -98,6 +98,39 @@ class CommandTest(unittest.TestCase):
     self.assertEqual(TODO.parse_todo_command(b'{"action":"complete"}'), {"action": "complete"})
 
 
+class AnnounceTest(unittest.TestCase):
+  PAYLOAD = json.dumps({"v": 1, "state": "2", "f": 15, "n": 2, "i": [
+    {"u": "a1", "t": "Feed the cat", "d": "2026-11-14T22:30"},
+    {"u": "b2", "t": "No time", "d": "2026-11-14"}]})
+
+  def test_only_a_published_item_just_due_is_announced(self):
+    cmd = {"action": "announce", "uid": "a1"}
+    self.assertEqual(TODO.announce_title(cmd, self.PAYLOAD, datetime(2026, 11, 14, 22, 30)), "Feed the cat")
+    self.assertEqual(TODO.announce_title(cmd, self.PAYLOAD, datetime(2026, 11, 14, 22, 44)), "Feed the cat")
+    self.assertIsNone(TODO.announce_title(cmd, self.PAYLOAD, datetime(2026, 11, 14, 22, 29)), "not due yet")
+    self.assertIsNone(TODO.announce_title(cmd, self.PAYLOAD, datetime(2026, 11, 14, 22, 45)), "too late")
+    self.assertIsNone(TODO.announce_title({"action": "announce", "uid": "b2"}, self.PAYLOAD,
+                                          datetime(2026, 11, 14, 22, 31)), "a due day without a time")
+    self.assertIsNone(TODO.announce_title({"action": "announce", "uid": "zz"}, self.PAYLOAD,
+                                          datetime(2026, 11, 14, 22, 31)), "unknown uid")
+    self.assertIsNone(TODO.announce_title({"action": "complete", "uid": "a1"}, self.PAYLOAD,
+                                          datetime(2026, 11, 14, 22, 31)))
+    self.assertIsNone(TODO.announce_title(cmd, "", datetime(2026, 11, 14, 22, 31)))
+
+  def test_reminder_follows_the_pipeline_language(self):
+    self.assertEqual(TODO.reminder_message("Feed the cat", "en-GB"), "Reminder: Feed the cat")
+    self.assertEqual(TODO.reminder_message("Katze", "de"), "Erinnerung: Katze")
+    self.assertEqual(TODO.reminder_message("x", "xx"), "Reminder: x")
+    self.assertEqual(TODO.reminder_message("x", None), "Reminder: x")
+
+  def test_handler_plays_chime_then_reminder_once(self):
+    source = (ROOT / "__init__.py").read_text(encoding="utf-8")
+    self.assertIn('if command.get("action") == "announce":', source)
+    self.assertIn('"media_content_id": todo_items.ANNOUNCE_CHIME_URL', source)
+    self.assertIn('await self.hass.services.async_call("tts", "speak", data, blocking=True)', source)
+    self.assertIn("if key in self._todo_announced:", source)
+
+
 class ListWiringTest(unittest.TestCase):
   def test_todos_are_a_picker_list_panel_list_and_sealed_command(self):
     self.assertEqual(CONTROL.PANEL_LIST_DOMAINS["todos"], ("todo",))

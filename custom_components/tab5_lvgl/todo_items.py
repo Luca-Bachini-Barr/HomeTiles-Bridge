@@ -17,7 +17,10 @@ bytes, total bytes); when it must drop items it drops the last ones.
 
 Commands: ``{base}/cmnd/todo`` with ``{"entity_id": ..., "action":
 "complete", "uid": ...}``. Only a uid the Bridge published for that list is
-accepted, and only when the list supports updating items. Pure functions, no
+accepted, and only when the list supports updating items. ``"action":
+"announce"`` (the panel's due alert) plays the Assist announce chime and a
+spoken reminder on the panel's speaker, only for a published item whose due
+time passed within ANNOUNCE_WINDOW_S, once per item. Pure functions, no
 Home Assistant imports: tests run them directly.
 """
 
@@ -42,6 +45,19 @@ MAX_TITLE_BYTES = 63
 MAX_UID_BYTES = 160
 MAX_PAYLOAD_BYTES = 8192
 MAX_COMMAND_BYTES = 512
+# The panel alerts an item once within this long after its due time.
+ANNOUNCE_WINDOW_S = 15 * 60
+# Home Assistant's own announce chime (assist_satellite static files).
+ANNOUNCE_CHIME_URL = "/api/assist_satellite/static/preannounce.mp3"
+# The chime is about a second long; the reminder follows it.
+ANNOUNCE_CHIME_S = 1.5
+# The spoken reminder, by the Assist pipeline's language (base code).
+_REMINDER = {
+  "en": "Reminder: {title}", "de": "Erinnerung: {title}", "fr": "Rappel : {title}",
+  "es": "Recordatorio: {title}", "it": "Promemoria: {title}", "nl": "Herinnering: {title}",
+  "pl": "Przypomnienie: {title}", "cs": "Připomenutí: {title}", "sk": "Pripomienka: {title}",
+  "pt": "Lembrete: {title}", "sv": "Påminnelse: {title}", "ru": "Напоминание: {title}",
+}
 
 # homeassistant.components.todo.TodoListEntityFeature.UPDATE_TODO_ITEM
 FEATURE_UPDATE_ITEM = 4
@@ -205,3 +221,44 @@ def build_todo_service_call(command: Mapping[str, Any], state: Optional[str],
   if not isinstance(uid, str) or not uid or uid not in set(published_uids):
     return None
   return "update_item", {"item": uid, "status": STATUS_DONE}
+
+
+def reminder_message(title: str, language: Optional[str]) -> str:
+  """The spoken reminder for `title` in the pipeline's language (English otherwise)."""
+  base = str(language or "en").split("-")[0].split("_")[0].lower()
+  return _REMINDER.get(base, _REMINDER["en"]).format(title=title)
+
+
+def announce_title(command: Mapping[str, Any], payload: str, now: datetime) -> Optional[str]:
+  """The title to announce for an "announce" command, None when not allowed.
+
+  `payload` is the list's last published payload and `now` local time
+  without an offset. Only an item of that payload with a due time that
+  passed less than ANNOUNCE_WINDOW_S ago is announced.
+  """
+  if command.get("action") != "announce":
+    return None
+  uid = command.get("uid")
+  if not isinstance(uid, str) or not uid:
+    return None
+  try:
+    body = json.loads(payload)
+  except ValueError:
+    return None
+  for item in (body.get("i") if isinstance(body, dict) else None) or ():
+    if not isinstance(item, dict) or item.get("u") != uid:
+      continue
+    due = item.get("d")
+    if not isinstance(due, str) or len(due) != 16:
+      return None
+    try:
+      moment = datetime.fromisoformat(due)
+    except ValueError:
+      return None
+    since = (now.replace(tzinfo=None) - moment).total_seconds()
+    title = item.get("t")
+    if 0 <= since < ANNOUNCE_WINDOW_S and isinstance(title, str) and title:
+      return title
+    return None
+  return None
+
