@@ -67,6 +67,8 @@ CONF_FANS = "fans"
 CONF_VACUUMS = "vacuums"
 # Calendars a Calendar tile may show (calendar_events.py).
 CONF_CALENDARS = "calendars"
+# To-do lists a To-do tile may show (todo_items.py).
+CONF_TODOS = "todos"
 # Locks and alarm panels that may be unlocked, opened or disarmed from a panel
 # without a code Home Assistant checks (only settable in the Bridge options).
 CONF_OPEN_WITHOUT_CODE = "open_without_code"

@@ -10,6 +10,7 @@ from ipaddress import ip_address
 import json
 import logging
 import secrets
+import os
 from time import monotonic
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
@@ -99,6 +100,8 @@ from .binary_sensor_helpers import (
 )
 from . import calendar_events
 from .calendar_events import CALENDAR_DOMAIN, REFRESH_S as CALENDAR_REFRESH_S
+from . import todo_items
+from .todo_items import TODO_DOMAIN, REFRESH_S as TODO_REFRESH_S
 from .control_helpers import (
   ACTION_DOMAINS,
   SWITCH_DOMAINS,
@@ -138,6 +141,7 @@ from .const import (
   CONF_ENERGY_GAS,
   CONF_ENERGY_WATER,
   CONF_CALENDARS,
+  CONF_TODOS,
   CONF_FANS,
   CONF_VACUUMS,
   CONF_HA_PREFIX,
@@ -281,6 +285,7 @@ from .local_camera import is_local_camera_self_loop, local_camera_command_topic
 from . import entity_icons
 from . import entity_search
 from .speaker import (
+  speaker_unique_id,
   AUDIO_RATE_SPEECH,
   AUDIO_STREAM_TRANSPORT,
   audio_command_topic,
@@ -784,6 +789,18 @@ async def async_setup(hass: HomeAssistant, config: Dict[str, Any]) -> bool:
   domain_data.setdefault(DATA_MQTT_ENTRIES, set())
 
   await async_ensure_link_runtime(hass)
+
+  if not domain_data.get("todo_sounds"):
+    # The To-do reminder's alarm (todo_items.ALARM_URL), public like
+    # Home Assistant's own announce chime.
+    try:
+      from homeassistant.components.http import StaticPathConfig
+      await hass.http.async_register_static_paths([
+        StaticPathConfig(todo_items.ALARM_URL, os.path.join(os.path.dirname(__file__), todo_items.ALARM_FILE), True),
+      ])
+      domain_data["todo_sounds"] = True
+    except Exception as err:
+      _LOGGER.warning("HomeTiles to-do alarm sound could not be served: %s", err)
 
   if "camera_stream_manager" not in domain_data:
     camera_stream_manager = CameraStreamManager(hass)
@@ -1593,6 +1610,9 @@ class Tab5Bridge:
     # Calendars a Calendar tile shows; their events travel on the retained
     # `events` topic (calendar_events.py, _async_publish_calendar_events).
     self.calendars: List[str] = _unique_entities(list(data.get(CONF_CALENDARS, [])))
+    # To-do lists a To-do tile shows; their open items travel on the retained
+    # `items` topic (todo_items.py, _async_publish_todo_items).
+    self.todos: List[str] = _unique_entities(list(data.get(CONF_TODOS, [])))
     # Scenes, scripts and buttons a Scene tile may run by its entity id
     # (released ones and, with a Web Admin password, declared ones).
     self.scenes: List[str] = []
@@ -1726,6 +1746,13 @@ class Tab5Bridge:
     self._calendar_task = None
     self._unsub_calendar_interval = None
     self._calendar_last_payload: Dict[str, str] = {}
+    self._todo_pending: set = set()
+    self._todo_refresh_handle = None
+    self._todo_task = None
+    self._unsub_todo_interval = None
+    self._todo_last_payload: Dict[str, str] = {}
+    self._todo_announced: Dict[str, float] = {}
+    self._unsub_todo = None
     self._weather_revision: Dict[str, int] = {}
     self._refresh_runtime_entity_lists()
 
@@ -1786,6 +1813,7 @@ class Tab5Bridge:
     all_fans: List[str] = []
     all_vacuums: List[str] = []
     all_calendars: List[str] = []
+    all_todos: List[str] = []
     all_open_without_code: List[str] = []
     all_access_codes: Dict[str, List[str]] = {}
     all_scene_map: Dict[str, str] = {}
@@ -1822,6 +1850,7 @@ class Tab5Bridge:
       all_fans.extend(list(data.get(CONF_FANS, [])))
       all_vacuums.extend(list(data.get(CONF_VACUUMS, [])))
       all_calendars.extend(list(data.get(CONF_CALENDARS, [])))
+      all_todos.extend(list(data.get(CONF_TODOS, [])))
       all_open_without_code.extend(list(data.get(CONF_OPEN_WITHOUT_CODE, [])))
       for entity_id, codes in _access_codes_of(data).items():
         all_access_codes.setdefault(entity_id, codes)
@@ -1850,6 +1879,7 @@ class Tab5Bridge:
       "fans": [item for item in _unique_entities(all_fans) if entity_domain(item) == FAN_DOMAIN],
       "vacuums": [item for item in _unique_entities(all_vacuums) if entity_domain(item) == VACUUM_DOMAIN],
       "calendars": [item for item in _unique_entities(all_calendars) if entity_domain(item) == CALENDAR_DOMAIN],
+      "todos": [item for item in _unique_entities(all_todos) if entity_domain(item) == TODO_DOMAIN],
       "open_without_code": _unique_entities(all_open_without_code),
       "access_codes": all_access_codes,
       "scene_map": all_scene_map,
@@ -1878,6 +1908,7 @@ class Tab5Bridge:
         "locks": source["locks"], "alarm_panels": source["alarm_panels"], "fans": source["fans"],
         "vacuums": source["vacuums"],
         "calendars": source["calendars"],
+        "todos": source["todos"],
         "scenes": _unique_entities(list(source["scene_map"].values())),
       }
 
@@ -1909,6 +1940,7 @@ class Tab5Bridge:
       + self.fans
       + self.vacuums
       + self.calendars
+      + self.todos
       + list(self.scene_map.values())
     )
     self._refresh_vacuum_companions()
@@ -2128,6 +2160,11 @@ class Tab5Bridge:
       f"{self.base_topic}/cmnd/vacuum",
       self._async_handle_vacuum_command,
     )
+    self._unsub_todo = await mqtt.async_subscribe(
+      self.hass,
+      f"{self.base_topic}/cmnd/todo",
+      self._async_handle_todo_command,
+    )
     # Lock and Alarm commands have no plain topic: they are accepted only
     # sealed from a paired panel (_command_handlers, _access_secured).
 
@@ -2219,6 +2256,7 @@ class Tab5Bridge:
     self._runtime_setup_complete = False
     await self._async_stop_weather_updates()
     self._stop_calendar_updates()
+    self._stop_todo_updates()
     # Release any state-publish ownership so a surviving entry can reclaim it.
     owners = self.hass.data.get(DOMAIN, {}).get("state_owners")
     if owners:
@@ -2263,6 +2301,9 @@ class Tab5Bridge:
     if self._unsub_vacuum:
       self._unsub_vacuum()
       self._unsub_vacuum = None
+    if getattr(self, "_unsub_todo", None):
+      self._unsub_todo()
+      self._unsub_todo = None
     if self._unsub_vacuum_registry:
       self._unsub_vacuum_registry()
       self._unsub_vacuum_registry = None
@@ -2363,6 +2404,8 @@ class Tab5Bridge:
           "vacuum_meta": self._build_entity_meta(self.vacuums),
           CONF_CALENDARS: self.calendars,
           "calendar_meta": self._build_entity_meta(self.calendars),
+          CONF_TODOS: self.todos,
+          "todo_meta": self._build_entity_meta(self.todos),
           "scene_meta": self._build_scene_meta(),
           "scene_map": self.scene_map,
           # The picker searches through this Bridge, and the panel declares
@@ -2370,8 +2413,9 @@ class Tab5Bridge:
           # the Energy dashboard's sources (entity_search.ENERGY_LIST), 4 =
           # also scenes, scripts and buttons for the Scene tile, 5 = also
           # calendars and their retained `events` topic (Calendar tile), 6 =
-          # also vacuums and their `detail` topic (Vacuum tile).
-          "entity_search": 6,
+          # also vacuums and their `detail` topic (Vacuum tile), 7 = also
+          # to-do lists and their retained `items` topic (To-do tile).
+          "entity_search": 7,
           # This Bridge sends name, unit and icon changes by itself
           # (_handle_state_event), so a panel that reads this flag needs no
           # refresh every minute, only after a reconnect or a lost message.
@@ -2433,6 +2477,10 @@ class Tab5Bridge:
     targets = calendars if entity_ids is None else [e for e in entity_ids if e in calendars]
     if targets:
       self._schedule_calendar_refresh(targets)
+    todos = getattr(self, "todos", [])
+    todo_targets = todos if entity_ids is None else [e for e in entity_ids if e in todos]
+    if todo_targets:
+      self._schedule_todo_refresh(todo_targets)
 
   def _editable_payload(self, entity_id, state):
     payload = build_editable_payload(
@@ -2595,6 +2643,216 @@ class Tab5Bridge:
       task.cancel()
       self._calendar_task = None
 
+
+  @callback
+  def _schedule_todo_refresh(self, entity_ids: Iterable[str]) -> None:
+    """Fetch and publish the open items of `entity_ids` shortly (coalesced)."""
+    if not self._runtime_setup_complete:
+      _LOGGER.debug("Tab5 to-do refresh skipped before setup: %s", list(entity_ids))
+      return
+    self._todo_pending.update(e for e in entity_ids if e in self.todos)
+    _LOGGER.debug("Tab5 to-do refresh scheduled: %s", sorted(self._todo_pending))
+    if self._todo_pending and self._unsub_todo_interval is None:
+      # Started with the first list: renamed items do not change the state.
+      self._unsub_todo_interval = async_track_time_interval(
+        self.hass, self._todo_interval_tick, timedelta(seconds=TODO_REFRESH_S)
+      )
+    if not self._todo_pending or self._todo_refresh_handle is not None:
+      return
+
+    @callback
+    def _due(_now) -> None:
+      self._todo_refresh_handle = None
+      # Home Assistant may run the task to its end before returning it (eager
+      # start), so a finished task, not None, also means "not running".
+      task = self._todo_task
+      if task is None or task.done():
+        self._todo_task = self.hass.async_create_task(self._async_process_todo_updates())
+
+    self._todo_refresh_handle = async_call_later(self.hass, todo_items.DEBOUNCE_S, _due)
+
+  @callback
+  def _todo_interval_tick(self, _now=None) -> None:
+    self._schedule_todo_refresh(self.todos)
+
+  async def _async_process_todo_updates(self) -> None:
+    while self._runtime_setup_complete and self._todo_pending:
+      entity_id = self._todo_pending.pop()
+      try:
+        await self._async_publish_todo_items(entity_id)
+      except Exception:
+        _LOGGER.debug("Tab5 to-do update failed for %s", entity_id, exc_info=True)
+
+  async def _async_publish_todo_items(self, entity_id: str) -> None:
+    """The To-do tile's open items of one list on its retained `items` topic."""
+    if entity_id not in self.todos or entity_domain(entity_id) != TODO_DOMAIN:
+      _LOGGER.debug("Tab5 to-do %s is not an offered list", entity_id)
+      return
+    if not self._owns_state_publish(entity_id):
+      _LOGGER.debug("Tab5 to-do %s is published by another entry", entity_id)
+      return
+    state = self.hass.states.get(entity_id)
+    if state is None or state.state == "unavailable":
+      payload = todo_items.unavailable_payload()
+    else:
+      try:
+        # A list whose integration never answers (seen with MS365 To Do)
+        # must not hold up the other lists' refreshes.
+        response = await asyncio.wait_for(
+          self.hass.services.async_call(
+            TODO_DOMAIN, "get_items",
+            {"entity_id": entity_id, "status": [todo_items.STATUS_OPEN]},
+            blocking=True, return_response=True,
+          ),
+          todo_items.FETCH_TIMEOUT_S,
+        )
+      except Exception as err:
+        # Keep the last retained items rather than publishing an empty list.
+        _LOGGER.debug("Tab5 todo.get_items failed for %s (%r)", entity_id, err)
+        return
+      items = todo_items.items_of_response(response, entity_id)
+      if items is None:
+        return
+      zone = getattr(dt_util, "get_default_time_zone", lambda: dt_util.DEFAULT_TIME_ZONE)()
+      payload = todo_items.build_payload(
+        items, state.state, todo_items.features_of(state.attributes), zone,
+      )
+    if self._todo_last_payload.get(entity_id) == payload:
+      _LOGGER.debug("Tab5 to-do items of %s unchanged", entity_id)
+      return
+    self._todo_last_payload[entity_id] = payload
+    _LOGGER.debug("Tab5 to-do items of %s published (%d bytes)", entity_id, len(payload))
+    await mqtt.async_publish(
+      self.hass, self._ha_topic_for_entity(entity_id, "items"), payload, qos=0, retain=True,
+    )
+
+  async def _async_wait_player_done(self, player: str) -> None:
+    """Waits until the panel's speaker started the last request and finished it."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + todo_items.PART_START_TIMEOUT_S
+    while loop.time() < deadline:
+      state = self.hass.states.get(player)
+      if state is not None and state.state == "playing":
+        break
+      await asyncio.sleep(0.2)
+    else:
+      return
+    deadline = loop.time() + todo_items.PART_MAX_S
+    while loop.time() < deadline:
+      state = self.hass.states.get(player)
+      if state is None or state.state != "playing":
+        return
+      await asyncio.sleep(0.2)
+
+  async def _async_announce_todo(self, entity_id: str, command: Dict[str, Any]) -> None:
+    """The panel's due alert on its speaker: an alarm (todo_items.ALARM_URL),
+    the task's title spoken, the alarm again, then its description spoken
+    when it has one, each part after the previous one finished. Speech uses the preferred
+    Assist pipeline's TTS; without one only the alarm plays."""
+    item = todo_items.announce_item(
+      command, self._todo_last_payload.get(entity_id, ""), dt_util.now().replace(tzinfo=None),
+    )
+    if item is None:
+      _LOGGER.debug("Ignoring HomeTiles to-do announce for %s (not a just-due item)", entity_id)
+      return
+    key = f"{entity_id}|{command.get('uid')}"
+    now = dt_util.utcnow().timestamp()
+    self._todo_announced = {k: t for k, t in self._todo_announced.items() if now - t < todo_items.ANNOUNCE_WINDOW_S}
+    if key in self._todo_announced:
+      return
+    self._todo_announced[key] = now
+    player = er.async_get(self.hass).async_get_entity_id(
+      "media_player", DOMAIN, speaker_unique_id(entry_device_id(self.entry)),
+    )
+    if not player:
+      _LOGGER.debug("HomeTiles to-do announce for %s: this panel has no speaker", entity_id)
+      return
+    engine, language, voice = None, None, None
+    try:
+      from homeassistant.components import assist_pipeline
+      pipeline = assist_pipeline.async_get_pipeline(self.hass)
+      engine, language, voice = pipeline.tts_engine, pipeline.tts_language, pipeline.tts_voice
+    except Exception as err:
+      _LOGGER.debug("HomeTiles to-do announce: no Assist pipeline (%r)", err)
+    if engine and not str(engine).startswith("tts."):
+      engine = None
+
+    async def speak(message: str) -> None:
+      data: Dict[str, Any] = {"entity_id": engine, "media_player_entity_id": player, "message": message}
+      if language:
+        data["language"] = language
+      if voice:
+        data["options"] = {"voice": voice}
+      await self.hass.services.async_call("tts", "speak", data, blocking=True)
+      await self._async_wait_player_done(player)
+
+    async def alarm() -> None:
+      await self.hass.services.async_call(
+        "media_player", "play_media",
+        {"entity_id": player, "media_content_id": todo_items.ALARM_URL,
+         "media_content_type": "music", "announce": True},
+        blocking=True,
+      )
+      await self._async_wait_player_done(player)
+
+    try:
+      await alarm()
+      if engine:
+        await speak(item["title"])
+        await alarm()
+      if engine and item["description"]:
+        await speak(item["description"])
+      _LOGGER.debug("HomeTiles to-do reminder announced for %s on %s", entity_id, player)
+    except Exception:
+      _LOGGER.warning("HomeTiles to-do reminder for %s could not play", entity_id, exc_info=True)
+
+  def _stop_todo_updates(self) -> None:
+    for name in ("_unsub_todo_interval", "_todo_refresh_handle"):
+      unsubscribe = getattr(self, name, None)
+      if unsubscribe is not None:
+        unsubscribe()
+        setattr(self, name, None)
+    getattr(self, "_todo_pending", set()).clear()
+    task = getattr(self, "_todo_task", None)
+    if task is not None:
+      task.cancel()
+      self._todo_task = None
+
+  async def _async_handle_todo_command(self, msg: Any) -> None:
+    """Tick off a To-do tile item; only a uid this Bridge published for the list."""
+    if getattr(msg, "retain", False):
+      return
+    command = todo_items.parse_todo_command(msg.payload)
+    if command is None:
+      if self._secure_log_due("todo_malformed"):
+        _LOGGER.warning("Unhandled to-do command from HomeTiles (malformed)")
+      return
+    raw_entity = command.get("entity_id")
+    entity_id = self._resolve_target_entity(
+      str(raw_entity).strip() if raw_entity is not None else None, self.todos,
+    )
+    if not entity_id or entity_domain(entity_id) != TODO_DOMAIN:
+      _LOGGER.warning("Unhandled to-do command from HomeTiles (unknown entity): %s", raw_entity)
+      return
+    if command.get("action") == "announce":
+      await self._async_announce_todo(entity_id, command)
+      return
+    state = self.hass.states.get(entity_id)
+    call = todo_items.build_todo_service_call(
+      command,
+      state.state if state is not None else None,
+      state.attributes if state is not None else {},
+      todo_items.uids_of_payload(self._todo_last_payload.get(entity_id, "")),
+    )
+    if call is None:
+      _LOGGER.debug("Ignoring unsupported or unknown HomeTiles to-do command for %s", entity_id)
+      return
+    service, service_data = call
+    await self.hass.services.async_call(
+      TODO_DOMAIN, service, {"entity_id": entity_id, **service_data}, blocking=True,
+    )
+    # Publish the shorter list at once instead of waiting for the state event.
+    self._schedule_todo_refresh([entity_id])
   def _access_secured(self, msg: Any, command: Dict[str, Any]) -> bool:
     """Lock and Alarm need a sealed command from a paired panel with a Web Admin password.
 
@@ -3346,6 +3604,7 @@ class Tab5Bridge:
       "camera": self._async_handle_camera_command,
       "fan": self._async_handle_fan_command,
       "vacuum": self._async_handle_vacuum_command,
+      "todo": self._async_handle_todo_command,
       "lock": self._async_handle_lock_command,
       "alarm": self._async_handle_alarm_command,
       "entities": self._async_handle_entities_command,
@@ -5768,6 +6027,10 @@ class Tab5Bridge:
       # The state turns on and off when an event starts or ends; edits of
       # future events show up through the periodic refresh.
       self._schedule_calendar_refresh([entity_id])
+    if entity_id in getattr(self, "todos", []):
+      # The state is the number of open items: it changes when an item is
+      # added or ticked off; renamed items show up through the periodic refresh.
+      self._schedule_todo_refresh([entity_id])
     if new_state is None:
       if entity_id in getattr(self, "numbers", []) + getattr(self, "selects", []) + getattr(self, "datetimes", []):
         self.hass.async_create_task(self._async_publish_editable_state(entity_id, None))

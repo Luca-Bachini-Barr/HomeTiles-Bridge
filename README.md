@@ -105,6 +105,10 @@ Fan tiles control on/off, speed, preset, oscillation and direction, each only wh
 
 Select them under **Calendars** in the entity configuration. A Calendar tile shows up to four of them. The Bridge reads their events with Home Assistant's `calendar.get_events` (the current month from a week before the 1st up to the two months after it) and publishes them retained on `ha_prefix/calendar/<object>/events`, in Home Assistant's local time: again when an event starts or ends, every 15 minutes (for edited future events and the new day), and on a snapshot. The list is bounded (96 events, 16 KB); when it has to drop events it drops the latest and shortens the window the panel shows, so a dropped day never looks free. Requires firmware with the Calendar tile; older firmware ignores the topic.
 
+### To-do lists
+
+Select them under **To-do lists** in the entity configuration. A To-do tile shows one of them. The Bridge reads the open items with Home Assistant's `todo.get_items` and publishes them retained on `ha_prefix/todo/<object>/items`: on a snapshot, when the list's open count changes, right after an item is ticked off on the panel, and every 5 minutes (for renamed items). The list is bounded (32 items, 8 KB). Ticking an item off on the panel sends `base_topic/cmnd/todo` (`{"entity_id": ..., "action": "complete", "uid": ...}`); the Bridge accepts only an item it published for that list and only when the list supports updating items, then calls `todo.update_item` with `status: completed`. Requires firmware with the To-do tile; older firmware ignores the topic.
+
 ## MQTT Topics
 
 The integration and the display exchange these topics over MQTT, or, for a display on the direct link (HomeTiles v0.9.0 or newer), with the same topics over the display's own connection to the Bridge (TCP port 8140, or up to 8147 when it is taken):
@@ -128,6 +132,8 @@ The integration and the display exchange these topics over MQTT, or, for a displ
 | `base_topic/stat/lock`, `base_topic/stat/alarm` | HA > Display | Result of an encrypted lock or alarm command (`ok`, `wrong_code`, `locked_out`, `busy`, ...; not retained) |
 | `ha_prefix/<domain>/<object>/detail` | HA > Display | Retained lock, alarm panel and fan tile state |
 | `ha_prefix/calendar/<object>/events` | HA > Display | Retained Calendar tile events |
+| `ha_prefix/todo/<object>/items` | HA > Display | Retained To-do tile items |
+| `base_topic/cmnd/todo` | Display > HA | Tick a To-do item off |
 | `base_topic/cmnd/camera` | Display > HA | Open or close an experimental camera stream |
 | `base_topic/stat/camera` | HA > Display | Camera stream endpoint, protocol and status |
 | `base_topic/secure/panel` | Display > HA | Encrypted commands, session requests and unpair once encrypted (replaces the `cmnd/*` topics above) |

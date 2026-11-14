@@ -159,6 +159,7 @@
           "fans": "Fans",
           "vacuums": "Vacuums",
           "calendars": "Calendars",
+          "todos": "To-do lists",
           "locks": "Locks",
           "alarm_panels": "Alarm panels",
           "open_without_code": "Allow opening without a code"
