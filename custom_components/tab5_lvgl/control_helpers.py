@@ -34,6 +34,7 @@ PANEL_LIST_DOMAINS = {
     "locks": ("lock",),
     "alarm_panels": ("alarm_control_panel",),
     "calendars": ("calendar",),
+    "todos": ("todo",),
 }
 
 
