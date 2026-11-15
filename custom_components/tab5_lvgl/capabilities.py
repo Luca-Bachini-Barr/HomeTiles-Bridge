@@ -12,7 +12,7 @@ def normalise_capabilities(value: Any) -> dict[str, bool]:
     if not isinstance(value, dict):
         raise ValueError("invalid_capabilities")
     result = {}
-    for key in ("audio_input", "audio_output", "battery_soc", "display_rotation", "display_theme",
+    for key in ("assist_view", "audio_input", "audio_output", "battery_soc", "display_rotation", "display_theme",
                 "legacy_external_temperature", "local_camera", "local_camera_stream", "view_navigation"):
         if key in value:
             if type(value[key]) is not bool:
@@ -34,7 +34,7 @@ def supports(data: Mapping[str, Any], capability: str) -> bool:
     if capability in explicit:
         return explicit[capability] is True
     if capability in ("view_navigation", "local_camera", "local_camera_stream", "audio_output",
-                      "audio_input", "display_theme", "display_rotation"):
+                      "audio_input", "assist_view", "display_theme", "display_rotation"):
         # Never inferred: only firmware that announces it can answer requests.
         return False
     # No fixed external channel exists once firmware announces local I/O,

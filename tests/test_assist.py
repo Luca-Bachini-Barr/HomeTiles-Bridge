@@ -284,6 +284,48 @@ class AssistContractTest(unittest.TestCase):
                 self.assertIn("message", data["exceptions"][key], name)
 
 
+class AssistViewContractTest(unittest.TestCase):
+    def test_view_command(self):
+        self.assertEqual(json.loads(ASSIST.build_view_command(ID, "listening")),
+                         {"v": 1, "op": "view", "id": ID, "stage": "listening"})
+        self.assertEqual(json.loads(ASSIST.build_view_command(
+            ID, "error", error="something-else")), {"v": 1, "op": "view", "id": ID,
+                                                    "stage": "error", "error": "failed"})
+        for stage, error in (("speaking", None), ("", None)):
+            with self.assertRaises(ValueError):
+                ASSIST.build_view_command(ID, stage, error=error)
+        with self.assertRaises(ValueError):
+            ASSIST.build_view_command("ABC", "done")
+
+    def test_error_kinds(self):
+        self.assertEqual(ASSIST.view_error_kind("stt-no-text-recognized"), "no_speech")
+        self.assertEqual(ASSIST.view_error_kind("wake-word-timeout"), "no_speech")
+        for code in ("stt-stream-failed", "intent-failed", "tts-failed", None, 3):
+            self.assertEqual(ASSIST.view_error_kind(code), "failed")
+
+    def test_text_is_tidied_and_cut_at_a_word(self):
+        self.assertEqual(ASSIST.clip_view_text("  a  b\r\n\n\n\nc \n", 100), "a b\n\nc")
+        self.assertEqual(ASSIST.clip_view_text(None, 100), "")
+        cut = ASSIST.clip_view_text("alpha beta gamma delta", 16)
+        self.assertEqual(cut, "alpha beta\u2026")
+        self.assertLessEqual(len(cut.encode()), 16)
+        # Never splits a character.
+        cut = ASSIST.clip_view_text("é" * 50, 21)
+        self.assertLessEqual(len(cut.encode()), 21)
+        self.assertTrue(cut.endswith("\u2026"))
+
+    def test_payload_fits_the_panel_limit(self):
+        for answer in ("é " * 3000, '"\\' * 3000, "\n x" * 3000, "a" * 5000):
+            text = ASSIST.build_view_command(ID, "responding", heard="h" * 1000, answer=answer)
+            self.assertLessEqual(len(text.encode("utf-8")), ASSIST.VIEW_MAX_PAYLOAD_BYTES)
+            payload = json.loads(text)
+            self.assertLessEqual(len(payload["heard"].encode()), ASSIST.VIEW_HEARD_MAX_BYTES)
+            self.assertLessEqual(len(payload["answer"].encode()), ASSIST.VIEW_ANSWER_MAX_BYTES)
+            self.assertTrue(payload["answer"])
+        # Not ASCII-escaped.
+        self.assertIn("°", ASSIST.build_view_command(ID, "responding", answer="12 °C"))
+
+
 class AssistSelectsTest(unittest.IsolatedAsyncioTestCase):
     """The Assistant select is what lists the panel under Assist devices."""
 
@@ -1017,6 +1059,174 @@ class AssistSatellitePlatformTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(satellite._session)
         # Late frames of the finished session go nowhere.
         await self.send_frames(session_id, 1, start=5)
+
+    async def start_view(self, bridge=None, pipeline=None):
+        [satellite] = await self.created(
+            self.satellite_module, entry({"audio_input": True, "assist_view": True}))
+        satellite.hass = FakeHass(bridge)
+        satellite.entity_id = "assist_satellite.panel_assist"
+        satellite.pipeline = pipeline or self.answer_pipeline
+        await satellite.async_added_to_hass()
+        return satellite
+
+    def view_commands(self, commands=None):
+        return [c for c in (self.assist_commands() if commands is None else commands)
+                if c["op"] == "view"]
+
+    async def answer_pipeline(self, satellite, stream):
+        """A run with an agent answer: STT text, intent answer, TTS."""
+        self.emit(satellite, EventType.RUN_START)
+        self.emit(satellite, EventType.STT_START)
+        async for chunk in stream:
+            self.chunks.append(chunk)
+            break
+        self.emit(satellite, EventType.STT_VAD_END)
+        self.emit(satellite, EventType.STT_END, {"stt_output": {"text": " what's the weather "}})
+        self.emit(satellite, EventType.INTENT_START)
+        self.emit(satellite, EventType.INTENT_END, {"intent_output": {
+            "response": {"speech": {"plain": {"speech": "Sunny,  12 °C."}}},
+            "conversation_id": "c1", "continue_conversation": False}})
+        self.emit(satellite, EventType.TTS_START, {"tts_input": "Sunny, 12 °C."})
+        self.emit(satellite, EventType.TTS_END, {"tts_output": {
+            "url": "/api/tts_proxy/abc.mp3", "mime_type": "audio/mpeg"}})
+        self.emit(satellite, EventType.RUN_END)
+        self.pipeline_done.set()
+
+    async def error_pipeline(self, satellite, stream):
+        """Nothing understood: the pipeline reports an error and ends."""
+        self.emit(satellite, EventType.RUN_START)
+        self.emit(satellite, EventType.STT_START)
+        async for chunk in stream:
+            break
+        self.emit(satellite, EventType.STT_END, {"stt_output": {"text": ""}})
+        self.emit(satellite, EventType.ERROR, {"code": "stt-no-text-recognized",
+                                               "message": "No text recognized"})
+        self.emit(satellite, EventType.RUN_END)
+        self.pipeline_done.set()
+
+    async def test_view_follows_the_run_and_ends_with_the_answer(self):
+        satellite = await self.start_view()
+        await satellite.async_start_tap_to_talk()
+        session_id = self.assist_commands()[0]["id"]
+        await settle()
+        await self.send_frames(session_id, 1)
+        await asyncio.wait_for(self.pipeline_done.wait(), 1)
+        await settle()
+        views = self.view_commands()
+        self.assertEqual(views, [
+            {"v": 1, "op": "view", "id": session_id, "stage": "listening"},
+            {"v": 1, "op": "view", "id": session_id, "stage": "processing",
+             "heard": "what's the weather"},
+            {"v": 1, "op": "view", "id": session_id, "stage": "responding",
+             "heard": "what's the weather", "answer": "Sunny, 12 °C."},
+        ])
+        # Not ASCII-escaped: UTF-8 counts toward the panel's limit once.
+        raw = [payload for topic, payload, _, _ in self.mqtt.published]
+        self.assertTrue(all(topic == f"{BASE}/cmnd/assist" or topic == f"{BASE}/cmnd/audio"
+                            for topic, *_ in self.mqtt.published))
+        self.assertIn("Sunny, 12 °C.", [v.get("answer") for v in raw if v.get("op") == "view"])
+        # Done only once the spoken answer finished.
+        [play] = self.audio_commands()
+        await self.deliver(f"{BASE}/stat/audio", json.dumps(
+            {"v": 1, "state": "idle", "volume": 0.5, "id": play["id"]}))
+        await settle()
+        self.assertEqual(self.view_commands()[-1],
+                         {"v": 1, "op": "view", "id": session_id, "stage": "done"})
+        self.assertEqual(len(self.view_commands()), 4)
+        # A late finish sends nothing more.
+        satellite._finish_tts()
+        await settle()
+        self.assertEqual(len(self.view_commands()), 4)
+
+    async def test_view_reports_an_error_then_done(self):
+        satellite = await self.start_view(pipeline=self.error_pipeline)
+        await satellite.async_start_tap_to_talk()
+        session_id = self.assist_commands()[0]["id"]
+        await settle()
+        await self.send_frames(session_id, 1)
+        await asyncio.wait_for(self.pipeline_done.wait(), 1)
+        await settle()
+        self.assertEqual([(v["stage"], v.get("error")) for v in self.view_commands()],
+                         [("listening", None), ("error", "no_speech"), ("done", None)])
+        self.assertEqual(self.audio_commands(), [])
+
+    async def test_view_for_a_wake_word_run_and_a_replaced_run(self):
+        satellite = await self.start_view()
+        await self.announce_wake_words()
+        await self.wake()
+        await settle()
+        first = self.assist_commands()[0]["id"]
+        self.assertEqual(self.view_commands()[0]["stage"], "listening")
+        # A press replaces the run: the old screen ends, the new one starts.
+        await satellite.async_start_tap_to_talk()
+        await settle()
+        second = [c for c in self.assist_commands() if c["op"] == "start"][-1]["id"]
+        self.assertNotEqual(first, second)
+        self.assertEqual([(v["id"], v["stage"]) for v in self.view_commands()][-1],
+                         (second, "listening"))
+
+    async def test_view_ends_when_the_pipeline_fails(self):
+        async def failing(satellite, stream):
+            async for _ in stream:
+                break
+            self.pipeline_done.set()
+            raise RuntimeError("stt engine gone")
+
+        satellite = await self.start_view(pipeline=failing)
+        await satellite.async_start_tap_to_talk()
+        session_id = self.assist_commands()[0]["id"]
+        await settle()
+        await self.send_frames(session_id, 1)
+        await asyncio.wait_for(self.pipeline_done.wait(), 1)
+        await settle()
+        self.assertEqual([v["stage"] for v in self.view_commands()], ["listening", "done"])
+        self.assertIsNone(satellite._view_id)
+
+    async def test_view_ends_when_the_entity_is_removed(self):
+        async def endless(satellite, stream):
+            await asyncio.Event().wait()
+
+        satellite = await self.start_view(pipeline=endless)
+        await satellite.async_start_tap_to_talk()
+        await settle()
+        await satellite.async_will_remove_from_hass()
+        await settle()
+        self.assertEqual([v["stage"] for v in self.view_commands()], ["listening", "done"])
+
+    async def test_replaced_run_ends_its_view_first(self):
+        satellite = await self.start_view(pipeline=lambda s, stream: asyncio.Event().wait())
+        await satellite.async_start_tap_to_talk()
+        await settle()
+        await satellite.async_start_tap_to_talk()
+        await settle()
+        views = [(v["id"], v["stage"]) for v in self.view_commands()]
+        starts = [c["id"] for c in self.assist_commands() if c["op"] == "start"]
+        self.assertEqual(views, [(starts[0], "listening"), (starts[0], "done"),
+                                 (starts[1], "listening")])
+
+    def test_answer_text_from_plain_or_ssml(self):
+        answer = self.satellite_module._answer_text
+        self.assertEqual(answer({"intent_output": {"response": {"speech": {
+            "plain": {"speech": " Line one.\n\nLine two. "}}}}}), "Line one.\n\nLine two.")
+        self.assertEqual(answer({"intent_output": {"response": {"speech": {
+            "ssml": {"speech": "<speak>It is <emphasis>sunny</emphasis>.</speak>"}}}}}),
+            "It is sunny .")
+        self.assertEqual(answer({"intent_output": {"response": {"speech": {}}}}), "")
+        self.assertEqual(answer({}), "")
+
+    async def test_view_is_sealed_when_paired(self):
+        bridge = SealingBridge()
+        satellite = await self.start_view(bridge=bridge)
+        await satellite.async_start_tap_to_talk()
+        await settle()
+        self.assertEqual(self.mqtt.published, [])
+        self.assertEqual([c["op"] for c in bridge.assist], ["start", "view"])
+
+    async def test_no_view_without_the_capability(self):
+        satellite = await self.start()
+        await satellite.async_start_tap_to_talk()
+        await settle()
+        self.assertEqual(self.view_commands(), [])
 
     async def test_paired_panel_uses_the_sealed_channel(self):
         bridge = SealingBridge()
