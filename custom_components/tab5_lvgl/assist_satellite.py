@@ -82,6 +82,14 @@ _WARNING_INTERVAL_S = 300.0
 # The satellite returns to idle when the speaker never reports the answer
 # finished (lost status, panel restart).
 TTS_FINISH_TIMEOUT_S = 120.0
+# The agent asked a question (continue_conversation): the panel listens again
+# once its spoken answer ended, like Home Assistant's own satellites. A
+# conversation keeps going for at most this many follow-ups in a row.
+MAX_FOLLOW_UPS = 5
+# The speaker hands I2S back to the microphone in this time after a clip.
+FOLLOW_UP_DELAY_S = 0.3
+# How long a follow-up waits for the answered run to finish its cleanup.
+FOLLOW_UP_WAIT_S = 2.0
 # Home Assistant converts the answer for the panel's decoder (mp3 or wav).
 _TTS_OPTIONS = {"preferred_format": "mp3"}
 
@@ -136,6 +144,13 @@ class HomeTilesAssistSatellite(AssistSatelliteEntity):
         self._tts_started = False
         self._tts_request_id: str | None = None
         self._tts_timer: asyncio.TimerHandle | None = None
+        # The current answer asked for a reply; follow-ups in a row so far.
+        self._follow_up = False
+        self._follow_ups = 0
+        # The delayed start of a follow-up (cancelled by a new run or removal).
+        self._follow_up_task: asyncio.Task | None = None
+        # Set once removal began: no follow-up may start any more.
+        self._removing = False
         # The panel's speaker takes Bridge-decoded clips (its retained status).
         self._speaker_streams = False
         self._warnings = RateLimitedWarnings(_WARNING_INTERVAL_S)
@@ -264,7 +279,7 @@ class HomeTilesAssistSatellite(AssistSatelliteEntity):
                 if status["error"]:
                     _LOGGER.warning("HomeTiles Assist answer on %s could not be played: %s",
                                     self._base, status["error"])
-                self._finish_tts()
+                self._finish_tts(played=not status["error"])
 
         # Microphone frames are binary; encoding=None delivers them as bytes.
         self._subscriptions.append(await mqtt.async_subscribe(
@@ -283,6 +298,8 @@ class HomeTilesAssistSatellite(AssistSatelliteEntity):
         if satellites.get(self._entry_id) is self:
             satellites.pop(self._entry_id, None)
         # Never leave the microphone running: the cancelled run sends stop.
+        self._removing = True
+        self._cancel_follow_up()
         await self._async_cancel_run()
         self._end_view()
         self._cancel_tts_timer()
@@ -423,8 +440,17 @@ class HomeTilesAssistSatellite(AssistSatelliteEntity):
         """Start one Assist run with the panel microphone."""
         await self._async_start_run(None)
 
-    async def _async_start_run(self, phrase: str | None) -> None:
-        """Start one Assist run; a wake word passes its phrase to the pipeline."""
+    async def _async_start_run(self, phrase: str | None, follow_up: bool = False) -> None:
+        """Start one Assist run; a wake word passes its phrase to the pipeline.
+
+        ``follow_up``: the agent's last answer asked a question; a wake word or
+        a press starts a new count.
+        """
+        self._follow_ups = self._follow_ups + 1 if follow_up else 0
+        self._follow_up = False
+        if not follow_up:
+            # A wake word or a press replaces a follow-up still waiting.
+            self._cancel_follow_up()
         if not self.available:
             raise HomeAssistantError(translation_domain=DOMAIN,
                                      translation_key="assist_unavailable")
@@ -484,6 +510,9 @@ class HomeTilesAssistSatellite(AssistSatelliteEntity):
         event_type = event.type
         if event_type in _STOP_EVENTS:
             self._request_stop(self._session)
+        if event_type is PipelineEventType.INTENT_END:
+            output = (event.data or {}).get("intent_output") or {}
+            self._follow_up = output.get("continue_conversation") is True
         self._view_pipeline_event(event)
         if event_type is PipelineEventType.TTS_START:
             self._tts_started = True
@@ -598,15 +627,54 @@ class HomeTilesAssistSatellite(AssistSatelliteEntity):
             self._tts_timer = None
 
     @callback
-    def _finish_tts(self) -> None:
-        """The spoken answer ended (played, failed, timed out or replaced)."""
+    def _finish_tts(self, played: bool = False) -> None:
+        """The spoken answer ended (played, failed, timed out or replaced).
+
+        ``played``: the panel played it to the end. When that answer asked a
+        question, the panel listens for the reply.
+        """
         had_answer = self._tts_request_id is not None or self._tts_started
+        follow_up = played and had_answer and self._follow_up
+        self._follow_up = False
         self._tts_request_id = None
         self._tts_started = False
         self._cancel_tts_timer()
         self._end_view()
         if had_answer and self.hass is not None:
             self.tts_response_finished()
+        if follow_up and self.hass is not None and not self._removing:
+            if self._follow_ups >= MAX_FOLLOW_UPS:
+                _LOGGER.debug("HomeTiles Assist on %s: %s follow-ups in a row, not listening again",
+                              self._base, self._follow_ups)
+                return
+            self._cancel_follow_up()
+            self._follow_up_task = self.hass.async_create_task(self._async_follow_up())
+
+    def _cancel_follow_up(self) -> None:
+        task = self._follow_up_task
+        self._follow_up_task = None
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+
+    async def _async_follow_up(self) -> None:
+        """Listen for the reply to the agent's question."""
+        await asyncio.sleep(FOLLOW_UP_DELAY_S)
+        # The answered run may still be sending its stop: wait for it briefly.
+        task = self._run_task
+        if task is not None and not task.done():
+            await asyncio.wait({task}, timeout=FOLLOW_UP_WAIT_S)
+        if self._run_active() or not self.available or self._removing:
+            return
+        # From here the start is like a press: no longer cancelled half-way
+        # (a start command already sent would leave capture without a run).
+        if self._follow_up_task is asyncio.current_task():
+            self._follow_up_task = None
+        try:
+            await self._async_start_run(None, follow_up=True)
+        except HomeAssistantError as err:
+            if self._warnings.allow("follow_up_failed", monotonic()):
+                _LOGGER.warning("HomeTiles Assist follow-up on %s not started: %s",
+                                self._base, err.translation_key or err)
 
 
 def _answer_text(data) -> str:
