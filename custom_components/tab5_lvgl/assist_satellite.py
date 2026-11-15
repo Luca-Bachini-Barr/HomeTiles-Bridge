@@ -149,6 +149,8 @@ class HomeTilesAssistSatellite(AssistSatelliteEntity):
         self._follow_ups = 0
         # The delayed start of a follow-up (cancelled by a new run or removal).
         self._follow_up_task: asyncio.Task | None = None
+        # Set once removal began: no follow-up may start any more.
+        self._removing = False
         # The panel's speaker takes Bridge-decoded clips (its retained status).
         self._speaker_streams = False
         self._warnings = RateLimitedWarnings(_WARNING_INTERVAL_S)
@@ -296,6 +298,7 @@ class HomeTilesAssistSatellite(AssistSatelliteEntity):
         if satellites.get(self._entry_id) is self:
             satellites.pop(self._entry_id, None)
         # Never leave the microphone running: the cancelled run sends stop.
+        self._removing = True
         self._cancel_follow_up()
         await self._async_cancel_run()
         self._end_view()
@@ -639,7 +642,7 @@ class HomeTilesAssistSatellite(AssistSatelliteEntity):
         self._end_view()
         if had_answer and self.hass is not None:
             self.tts_response_finished()
-        if follow_up and self.hass is not None:
+        if follow_up and self.hass is not None and not self._removing:
             if self._follow_ups >= MAX_FOLLOW_UPS:
                 _LOGGER.debug("HomeTiles Assist on %s: %s follow-ups in a row, not listening again",
                               self._base, self._follow_ups)
@@ -660,8 +663,12 @@ class HomeTilesAssistSatellite(AssistSatelliteEntity):
         task = self._run_task
         if task is not None and not task.done():
             await asyncio.wait({task}, timeout=FOLLOW_UP_WAIT_S)
-        if self._run_active() or not self.available:
+        if self._run_active() or not self.available or self._removing:
             return
+        # From here the start is like a press: no longer cancelled half-way
+        # (a start command already sent would leave capture without a run).
+        if self._follow_up_task is asyncio.current_task():
+            self._follow_up_task = None
         try:
             await self._async_start_run(None, follow_up=True)
         except HomeAssistantError as err:
