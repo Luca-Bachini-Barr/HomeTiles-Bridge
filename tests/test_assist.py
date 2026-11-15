@@ -1214,6 +1214,92 @@ class AssistSatellitePlatformTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(answer({"intent_output": {"response": {"speech": {}}}}), "")
         self.assertEqual(answer({}), "")
 
+    def question_pipeline(self, continue_conversation=True):
+        """An answer that asks a question (continue_conversation) and is spoken."""
+        async def pipeline(satellite, stream):
+            async for chunk in stream:
+                break
+            self.emit(satellite, EventType.STT_END, {"stt_output": {"text": "add to my list"}})
+            self.emit(satellite, EventType.INTENT_END, {"intent_output": {
+                "response": {"speech": {"plain": {"speech": "Which list?"}}},
+                "conversation_id": "c1", "continue_conversation": continue_conversation}})
+            self.emit(satellite, EventType.TTS_START, {"tts_input": "Which list?"})
+            self.emit(satellite, EventType.TTS_END, {"tts_output": {
+                "url": "/api/tts_proxy/q.mp3", "mime_type": "audio/mpeg"}})
+            self.emit(satellite, EventType.RUN_END)
+            self.pipeline_done.set()
+        return pipeline
+
+    def starts(self):
+        return [c["id"] for c in self.assist_commands() if c["op"] == "start"]
+
+    async def play_to_end(self, error=None):
+        """The panel reports the last answer clip finished (or failed)."""
+        play = self.audio_commands()[-1]
+        await self.deliver(f"{BASE}/stat/audio", json.dumps(dict(
+            {"v": 1, "state": "idle", "volume": 0.5, "id": play["id"]},
+            **({"error": error} if error else {}))))
+        await settle()
+
+    async def run_once(self, satellite):
+        session_id = self.starts()[-1]
+        await settle()
+        self.pipeline_done.clear()
+        await self.send_frames(session_id, 1)
+        await asyncio.wait_for(self.pipeline_done.wait(), 1)
+        await settle()
+
+    async def test_question_listens_again_after_the_answer(self):
+        self.satellite_module.FOLLOW_UP_DELAY_S = 0
+        satellite = await self.start_view(pipeline=self.question_pipeline())
+        await satellite.async_start_tap_to_talk()
+        await self.run_once(satellite)
+        self.assertEqual(len(self.starts()), 1)
+        await self.play_to_end()
+        await settle()
+        starts = self.starts()
+        self.assertEqual(len(starts), 2, "the reply gets its own run")
+        self.assertNotEqual(starts[0], starts[1])
+        # The panel shows the old run done and the new one listening.
+        self.assertEqual([(v["id"], v["stage"]) for v in self.view_commands()][-2:],
+                         [(starts[0], "done"), (starts[1], "listening")])
+        self.assertEqual(satellite.stages, (Stage.STT, Stage.TTS))
+
+    async def test_no_follow_up_without_a_question_or_when_not_played(self):
+        self.satellite_module.FOLLOW_UP_DELAY_S = 0
+        satellite = await self.start_view(pipeline=self.question_pipeline(False))
+        await satellite.async_start_tap_to_talk()
+        await self.run_once(satellite)
+        await self.play_to_end()
+        await settle()
+        self.assertEqual(len(self.starts()), 1)
+        # A question whose answer could not be played does not listen again.
+        satellite.pipeline = self.question_pipeline(True)
+        await satellite.async_start_tap_to_talk()
+        await self.run_once(satellite)
+        await self.play_to_end(error="invalid_url")
+        await settle()
+        self.assertEqual(len(self.starts()), 2)
+
+    async def test_follow_ups_stop_after_the_limit(self):
+        self.satellite_module.FOLLOW_UP_DELAY_S = 0
+        satellite = await self.start_view(pipeline=self.question_pipeline())
+        await satellite.async_start_tap_to_talk()
+        for _ in range(self.satellite_module.MAX_FOLLOW_UPS + 2):
+            before = len(self.starts())
+            await self.run_once(satellite)
+            await self.play_to_end()
+            await settle()
+            if len(self.starts()) == before:
+                break
+        self.assertEqual(len(self.starts()), 1 + self.satellite_module.MAX_FOLLOW_UPS)
+        # A wake word or a press starts a new count.
+        await satellite.async_start_tap_to_talk()
+        await self.run_once(satellite)
+        await self.play_to_end()
+        await settle()
+        self.assertEqual(len(self.starts()), 3 + self.satellite_module.MAX_FOLLOW_UPS)
+
     async def test_view_is_sealed_when_paired(self):
         bridge = SealingBridge()
         satellite = await self.start_view(bridge=bridge)
