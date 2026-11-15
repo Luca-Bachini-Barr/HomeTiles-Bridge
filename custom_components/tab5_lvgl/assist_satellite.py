@@ -8,6 +8,10 @@ the existing speaker play command (speaker.py), decoded by the Bridge when the
 panel takes Bridge streams (audio_stream.py). Only panels that announce the
 ``audio_input`` capability get the entity.
 
+Assist screen: panels that announce ``assist_view`` get the run's stage and
+texts (what was understood, the answer) as view commands, and "done" once the
+spoken answer ended, so the panel can show the conversation.
+
 Wake word: the panel detects microWakeWord models itself and reports them on
 ``{base}/stat/assist_wake``; the Bridge then runs the same flow as a button
 press and passes the word's phrase to the pipeline. The words come from the
@@ -52,12 +56,14 @@ from .assist import (
     async_publish_assist_command,
     build_start_command,
     build_stop_command,
+    build_view_command,
     build_mic_command,
     build_wake_words_command,
     new_session_id,
     parse_audio_frame,
     parse_status,
     parse_wake_event,
+    view_error_kind,
     wake_choice,
     wake_word_info,
     wake_word_phrase,
@@ -115,6 +121,12 @@ class HomeTilesAssistSatellite(AssistSatelliteEntity):
         self._attr_device_info = entry_device_info(entry)
         self._device_id = entry_device_id(entry)
         self._attr_unique_id = assist_satellite_unique_id(self._device_id)
+        # The panel shows the run (assist_view.h): stage and texts.
+        self._view = supports(merged_capabilities_data(entry), "assist_view")
+        # The run the panel's screen shows; outlives the capture session
+        # while the answer plays.
+        self._view_id: str | None = None
+        self._view_heard: str | None = None
         self._base = base_topic
         self._session: AudioSession | None = None
         self._run_task: asyncio.Task | None = None
@@ -432,6 +444,9 @@ class HomeTilesAssistSatellite(AssistSatelliteEntity):
                 self._session = None
             raise HomeAssistantError(translation_domain=DOMAIN,
                                      translation_key="assist_not_connected")
+        self._view_id = session.session_id
+        self._view_heard = None
+        self._send_view("listening")
         self._run_task = self.hass.async_create_background_task(
             self._async_run(session, phrase), f"{DOMAIN}_assist_{self._entry_id}")
 
@@ -462,6 +477,7 @@ class HomeTilesAssistSatellite(AssistSatelliteEntity):
         event_type = event.type
         if event_type in _STOP_EVENTS:
             self._request_stop(self._session)
+        self._view_pipeline_event(event)
         if event_type is PipelineEventType.TTS_START:
             self._tts_started = True
         elif event_type is PipelineEventType.TTS_END:
@@ -470,7 +486,55 @@ class HomeTilesAssistSatellite(AssistSatelliteEntity):
             if self._tts_started and self._tts_request_id is None:
                 # TTS started but produced nothing playable.
                 self._finish_tts()
+            elif self._tts_request_id is None:
+                # Nothing to play (error, no TTS stage): the run is over.
+                self._end_view()
             self._tts_started = False
+
+    # Assist screen -------------------------------------------------------
+
+    def _view_pipeline_event(self, event: PipelineEvent) -> None:
+        if self._view_id is None:
+            return
+        data = event.data or {}
+        event_type = event.type
+        if event_type is PipelineEventType.STT_END:
+            text = ((data.get("stt_output") or {}).get("text") or "").strip()
+            if text:
+                self._view_heard = text
+                self._send_view("processing", heard=text)
+        elif event_type is PipelineEventType.INTENT_END:
+            answer = _answer_text(data)
+            if answer:
+                self._send_view("responding", heard=self._view_heard, answer=answer)
+        elif event_type is PipelineEventType.ERROR:
+            self._send_view("error", error=view_error_kind(data.get("code")))
+
+    def _send_view(self, stage: str, **texts) -> None:
+        view_id = self._view_id
+        if not self._view or view_id is None or self.hass is None:
+            return
+        try:
+            payload = build_view_command(view_id, stage, **texts)
+        except ValueError as err:
+            _LOGGER.debug("HomeTiles Assist view for %s not built: %s", self._base, err)
+            return
+        self.hass.async_create_task(self._async_send_view(payload))
+
+    async def _async_send_view(self, payload: str) -> None:
+        try:
+            await self._async_send_assist(payload)
+        except Exception as err:  # noqa: BLE001 - the panel's screen times out
+            _LOGGER.debug("HomeTiles Assist view for %s failed: %s", self._base, err)
+
+    @callback
+    def _end_view(self) -> None:
+        """The run and its spoken answer ended: the panel closes its screen."""
+        if self._view_id is None:
+            return
+        self._send_view("done")
+        self._view_id = None
+        self._view_heard = None
 
     @callback
     def _play_answer(self, data) -> None:
@@ -533,5 +597,17 @@ class HomeTilesAssistSatellite(AssistSatelliteEntity):
         self._tts_request_id = None
         self._tts_started = False
         self._cancel_tts_timer()
+        self._end_view()
         if had_answer and self.hass is not None:
             self.tts_response_finished()
+
+
+def _answer_text(data) -> str:
+    """The spoken answer of an intent-end event (ConversationResult.as_dict)."""
+    response = (data.get("intent_output") or {}).get("response") or {}
+    speech = response.get("speech") or {}
+    for kind in ("plain", "ssml"):
+        text = (speech.get(kind) or {}).get("speech")
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+    return ""

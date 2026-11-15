@@ -234,6 +234,76 @@ def build_wake_words_command(active: Any, listen: bool | None = None) -> str:
     return _encode(payload)
 
 
+# Assist screen (panel capability "assist_view"): the run's stage and texts.
+VIEW_STAGES = frozenset({"listening", "processing", "responding", "error", "done"})
+VIEW_ERRORS = frozenset({"no_speech", "failed"})
+# The panel's view command limit is 2048 bytes (assist_view.h) and so is the
+# sealed body; stay below it with room for the envelope.
+VIEW_MAX_PAYLOAD_BYTES = 1900
+VIEW_HEARD_MAX_BYTES = 240
+VIEW_ANSWER_MAX_BYTES = 1200
+# Pipeline error codes that mean nothing was said or understood.
+_NO_SPEECH_ERRORS = frozenset({"stt-no-text-recognized", "wake-word-timeout"})
+_ELLIPSIS = "\u2026"
+
+
+def view_error_kind(code: Any) -> str:
+    """The panel's error kind for an Assist pipeline error code."""
+    return "no_speech" if code in _NO_SPEECH_ERRORS else "failed"
+
+
+def clip_view_text(text: Any, max_bytes: int) -> str:
+    """Whitespace-tidied text of at most ``max_bytes`` UTF-8 bytes.
+
+    Runs of spaces become one, more than one blank line becomes one, and a
+    cut text ends at a word with an ellipsis.
+    """
+    if not isinstance(text, str):
+        return ""
+    lines = [" ".join(line.split()) for line in text.replace("\r", "").split("\n")]
+    tidy: list[str] = []
+    for line in lines:
+        if line or (tidy and tidy[-1]):
+            tidy.append(line)
+    text = "\n".join(tidy).strip()
+    if len(text.encode("utf-8")) <= max_bytes:
+        return text
+    budget = max_bytes - len(_ELLIPSIS.encode("utf-8"))
+    cut = text.encode("utf-8")[:max(0, budget)].decode("utf-8", "ignore")
+    space = cut.rfind(" ")
+    if space > len(cut) // 2:
+        cut = cut[:space]
+    return cut.rstrip(" ,;:.\n") + _ELLIPSIS
+
+
+def build_view_command(session_id: str, stage: str, heard: Any = None, answer: Any = None,
+                       error: str | None = None) -> str:
+    """The Assist screen's view command; texts shrink to fit the panel's limit."""
+    if not valid_session_id(session_id):
+        raise ValueError("invalid_session_id")
+    if stage not in VIEW_STAGES:
+        raise ValueError("invalid_stage")
+    payload: dict[str, Any] = {"v": ASSIST_PROTOCOL_VERSION, "op": "view", "id": session_id,
+                               "stage": stage}
+    if heard is not None:
+        payload["heard"] = clip_view_text(heard, VIEW_HEARD_MAX_BYTES)
+    if error is not None:
+        payload["error"] = error if error in VIEW_ERRORS else "failed"
+    answer_bytes = VIEW_ANSWER_MAX_BYTES
+    while True:
+        if answer is not None:
+            payload["answer"] = clip_view_text(answer, answer_bytes)
+        # Not ASCII-escaped: the panel takes UTF-8, and \u escapes would take
+        # six bytes per character of the limit.
+        text = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+        size = len(text.encode("utf-8"))
+        if size <= VIEW_MAX_PAYLOAD_BYTES or answer is None or answer_bytes <= 0:
+            break
+        # Escaped quotes and line breaks grew the answer: cut it further.
+        answer_bytes -= max(16, size - VIEW_MAX_PAYLOAD_BYTES)
+    return text
+
+
 def build_mic_command(enabled: Any) -> str:
     """The panel's microphone privacy switch.
 
