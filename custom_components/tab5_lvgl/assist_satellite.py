@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 from time import monotonic
 
 from homeassistant.components.assist_pipeline import (
@@ -283,6 +284,7 @@ class HomeTilesAssistSatellite(AssistSatelliteEntity):
             satellites.pop(self._entry_id, None)
         # Never leave the microphone running: the cancelled run sends stop.
         await self._async_cancel_run()
+        self._end_view()
         self._cancel_tts_timer()
         self._tts_request_id = None
         for unsubscribe in self._subscriptions:
@@ -470,6 +472,11 @@ class HomeTilesAssistSatellite(AssistSatelliteEntity):
                 await self._async_publish_stop(session.session_id)
             if self._session is session:
                 self._session = None
+            # A run that failed or was cancelled before its answer still
+            # closes the panel's screen (an answer playing ends it later).
+            if (self._view_id == session.session_id and self._tts_request_id is None
+                    and not self._tts_started):
+                self._end_view()
 
     # Pipeline ------------------------------------------------------------
 
@@ -608,6 +615,12 @@ def _answer_text(data) -> str:
     speech = response.get("speech") or {}
     for kind in ("plain", "ssml"):
         text = (speech.get(kind) or {}).get("speech")
+        if isinstance(text, str) and kind == "ssml":
+            # The panel shows the words, not the markup.
+            text = " ".join(_SSML_TAG.sub(" ", text).split())
         if isinstance(text, str) and text.strip():
             return text.strip()
     return ""
+
+
+_SSML_TAG = re.compile(r"<[^>]*>")

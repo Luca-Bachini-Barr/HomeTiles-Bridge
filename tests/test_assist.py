@@ -1165,6 +1165,55 @@ class AssistSatellitePlatformTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([(v["id"], v["stage"]) for v in self.view_commands()][-1],
                          (second, "listening"))
 
+    async def test_view_ends_when_the_pipeline_fails(self):
+        async def failing(satellite, stream):
+            async for _ in stream:
+                break
+            self.pipeline_done.set()
+            raise RuntimeError("stt engine gone")
+
+        satellite = await self.start_view(pipeline=failing)
+        await satellite.async_start_tap_to_talk()
+        session_id = self.assist_commands()[0]["id"]
+        await settle()
+        await self.send_frames(session_id, 1)
+        await asyncio.wait_for(self.pipeline_done.wait(), 1)
+        await settle()
+        self.assertEqual([v["stage"] for v in self.view_commands()], ["listening", "done"])
+        self.assertIsNone(satellite._view_id)
+
+    async def test_view_ends_when_the_entity_is_removed(self):
+        async def endless(satellite, stream):
+            await asyncio.Event().wait()
+
+        satellite = await self.start_view(pipeline=endless)
+        await satellite.async_start_tap_to_talk()
+        await settle()
+        await satellite.async_will_remove_from_hass()
+        await settle()
+        self.assertEqual([v["stage"] for v in self.view_commands()], ["listening", "done"])
+
+    async def test_replaced_run_ends_its_view_first(self):
+        satellite = await self.start_view(pipeline=lambda s, stream: asyncio.Event().wait())
+        await satellite.async_start_tap_to_talk()
+        await settle()
+        await satellite.async_start_tap_to_talk()
+        await settle()
+        views = [(v["id"], v["stage"]) for v in self.view_commands()]
+        starts = [c["id"] for c in self.assist_commands() if c["op"] == "start"]
+        self.assertEqual(views, [(starts[0], "listening"), (starts[0], "done"),
+                                 (starts[1], "listening")])
+
+    def test_answer_text_from_plain_or_ssml(self):
+        answer = self.satellite_module._answer_text
+        self.assertEqual(answer({"intent_output": {"response": {"speech": {
+            "plain": {"speech": " Line one.\n\nLine two. "}}}}}), "Line one.\n\nLine two.")
+        self.assertEqual(answer({"intent_output": {"response": {"speech": {
+            "ssml": {"speech": "<speak>It is <emphasis>sunny</emphasis>.</speak>"}}}}}),
+            "It is sunny .")
+        self.assertEqual(answer({"intent_output": {"response": {"speech": {}}}}), "")
+        self.assertEqual(answer({}), "")
+
     async def test_view_is_sealed_when_paired(self):
         bridge = SealingBridge()
         satellite = await self.start_view(bridge=bridge)
