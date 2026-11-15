@@ -88,6 +88,8 @@ TTS_FINISH_TIMEOUT_S = 120.0
 MAX_FOLLOW_UPS = 5
 # The speaker hands I2S back to the microphone in this time after a clip.
 FOLLOW_UP_DELAY_S = 0.3
+# How long a follow-up waits for the answered run to finish its cleanup.
+FOLLOW_UP_WAIT_S = 2.0
 # Home Assistant converts the answer for the panel's decoder (mp3 or wav).
 _TTS_OPTIONS = {"preferred_format": "mp3"}
 
@@ -145,6 +147,8 @@ class HomeTilesAssistSatellite(AssistSatelliteEntity):
         # The current answer asked for a reply; follow-ups in a row so far.
         self._follow_up = False
         self._follow_ups = 0
+        # The delayed start of a follow-up (cancelled by a new run or removal).
+        self._follow_up_task: asyncio.Task | None = None
         # The panel's speaker takes Bridge-decoded clips (its retained status).
         self._speaker_streams = False
         self._warnings = RateLimitedWarnings(_WARNING_INTERVAL_S)
@@ -292,6 +296,7 @@ class HomeTilesAssistSatellite(AssistSatelliteEntity):
         if satellites.get(self._entry_id) is self:
             satellites.pop(self._entry_id, None)
         # Never leave the microphone running: the cancelled run sends stop.
+        self._cancel_follow_up()
         await self._async_cancel_run()
         self._end_view()
         self._cancel_tts_timer()
@@ -440,6 +445,9 @@ class HomeTilesAssistSatellite(AssistSatelliteEntity):
         """
         self._follow_ups = self._follow_ups + 1 if follow_up else 0
         self._follow_up = False
+        if not follow_up:
+            # A wake word or a press replaces a follow-up still waiting.
+            self._cancel_follow_up()
         if not self.available:
             raise HomeAssistantError(translation_domain=DOMAIN,
                                      translation_key="assist_unavailable")
@@ -636,11 +644,22 @@ class HomeTilesAssistSatellite(AssistSatelliteEntity):
                 _LOGGER.debug("HomeTiles Assist on %s: %s follow-ups in a row, not listening again",
                               self._base, self._follow_ups)
                 return
-            self.hass.async_create_task(self._async_follow_up())
+            self._cancel_follow_up()
+            self._follow_up_task = self.hass.async_create_task(self._async_follow_up())
+
+    def _cancel_follow_up(self) -> None:
+        task = self._follow_up_task
+        self._follow_up_task = None
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
 
     async def _async_follow_up(self) -> None:
         """Listen for the reply to the agent's question."""
         await asyncio.sleep(FOLLOW_UP_DELAY_S)
+        # The answered run may still be sending its stop: wait for it briefly.
+        task = self._run_task
+        if task is not None and not task.done():
+            await asyncio.wait({task}, timeout=FOLLOW_UP_WAIT_S)
         if self._run_active() or not self.available:
             return
         try:

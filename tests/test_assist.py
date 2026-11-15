@@ -1281,6 +1281,33 @@ class AssistSatellitePlatformTest(unittest.IsolatedAsyncioTestCase):
         await settle()
         self.assertEqual(len(self.starts()), 2)
 
+    async def test_follow_up_cancelled_by_a_press_or_removal(self):
+        self.satellite_module.FOLLOW_UP_DELAY_S = 0.05
+        satellite = await self.start_view(pipeline=self.question_pipeline())
+        await satellite.async_start_tap_to_talk()
+        await self.run_once(satellite)
+        await self.play_to_end()
+        # Removed while the follow-up waits: it never starts.
+        await satellite.async_will_remove_from_hass()
+        await asyncio.sleep(0.1)
+        await settle()
+        self.assertEqual(len(self.starts()), 1)
+
+    async def test_press_replaces_a_waiting_follow_up(self):
+        self.satellite_module.FOLLOW_UP_DELAY_S = 0.05
+        satellite = await self.start_view(pipeline=self.question_pipeline(False))
+        satellite.pipeline = self.question_pipeline(True)
+        await satellite.async_start_tap_to_talk()
+        await self.run_once(satellite)
+        await self.play_to_end()
+        satellite.pipeline = lambda s, stream: asyncio.Event().wait()
+        await satellite.async_start_tap_to_talk()
+        await asyncio.sleep(0.1)
+        await settle()
+        # The press's run only; the stale follow-up was cancelled.
+        self.assertEqual(len(self.starts()), 2)
+        await satellite.async_will_remove_from_hass()
+
     async def test_follow_ups_stop_after_the_limit(self):
         self.satellite_module.FOLLOW_UP_DELAY_S = 0
         satellite = await self.start_view(pipeline=self.question_pipeline())
